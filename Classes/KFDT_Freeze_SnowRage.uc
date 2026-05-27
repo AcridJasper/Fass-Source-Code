@@ -10,5 +10,5 @@ defaultproperties
 	bIgnoreSelfInflictedScale=true
 
 	KDamageImpulse=0
-	FreezePower=35
+	FreezePower=50
 }
