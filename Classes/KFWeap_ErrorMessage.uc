@@ -63,11 +63,7 @@ var Font FuroreFont;
 simulated event PostBeginPlay()
 {
 	Super.PostBeginPlay();
-
 	CosTargetAngle = Cos(MaxTargetAngle * DegToRad);
-
-	// if( Role == ROLE_Authority )
-
 	FuroreFont = Font(DynamicLoadObject("Fass_MAT.Fass_Font", class'Font'));
 }
 
