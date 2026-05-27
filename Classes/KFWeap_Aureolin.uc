@@ -29,6 +29,21 @@ var	class<DamageType> UpgradedDamageType;
 // ****************************** Fire Trap ******************************
 var bool LineEmUpActive;
 
+// ****************************** Parascope ******************************
+// Unscopes user if damaged
+var() config bool UnscopeOnDamaged;
+// Colors for user to change in-game
+var() config Color CrosshairColorNeutral, CrosshairColorEmpty, CrosshairColorTargetingZED, CrosshairColorTargetingFriendly;
+var() config Color PerkCrosshairColorNeutral, PerkCrosshairColorTargetingZED, PerkCrosshairColorTargetingFriendly;
+var() config Color ScopeRingInnerColorNeutral, ScopeRingInnerColorEmpty, ScopeRingInnerColorTargetingZED, ScopeRingInnerColorTargetingFriendly;
+// Togglible UI elements
+var() config bool EnableZoomLevelDisplay;
+var() config Color ZoomLevelDisplayColor;
+// Scope ring overlay
+var() config float SeeThroughFloat, SeeThroughRingFloat;
+// Zoom in\out sounds
+var SoundCue IronsightZoomInSound, IronsightZoomOutSound;
+
 // ****************************** Misc ******************************
 // Secret :) (VerySecret™)
 var bool VerySecretMessage;
@@ -36,19 +51,21 @@ var string VerySecretText;
 
 var float SuperSecretMessageChance;
 
+var Font FuroreFont;
+
 // struct DamageMultiplierByZed
 // {
 // 	var Name ZedClassName;
 // 	var float DamageMultiplier;
 // };
-
 // var array<DamageMultiplierByZed> DamageMultiplierByZedArray;
 
-// simulated event PostBeginPlay()
-// {
-	// Super.PostBeginPlay();
-	// if( Role == ROLE_Authority )
-// }
+// Called immediately after gameplay begins
+simulated event PostBeginPlay()
+{
+	Super.PostBeginPlay();
+	FuroreFont = Font(DynamicLoadObject("Fass_MAT.Fass_Font", class'Font'));
+}
 
 // ****************************** Combustion Rounds / Perk passive ******************************
 
@@ -139,6 +156,13 @@ simulated function ConsumeAmmo( byte FireModeNum )
 	// if( WorldInfo.NetMode != NM_DedicatedServer )
 	if( Role == ROLE_Authority )
 	{
+		// Fire Clip
+		if( DrawHudPassive2 )
+        	InstantHitDamageTypes[0] = UpgradedDamageType;
+        else
+        	InstantHitDamageTypes[0] = class'KFDT_Ballistic_Aureolin'; // otherwise change it because TZS
+
+        // Combustion Rounds
 		if( AmmoCount[0] == 0 )
 			ANIMNOTIFY_ClearVFX();
 	}
@@ -292,6 +316,60 @@ simulated function AutoLoadingHolster()
 }
 */
 
+// ****************************** Scope functions ******************************
+
+function AdjustDamage(out int InDamage, class<DamageType> DamageType, Actor DamageCauser)
+{
+	local KFPlayerController KFPC;
+
+    super.AdjustDamage(InDamage, DamageType, DamageCauser);
+	
+	// Unscope user if grabbed by ZED
+	KFPC = KFPlayerController(Instigator.Controller);
+	if( KFPC.bGrabEffectIsActive && bUsingSights )
+		SetIronSights(false);
+
+	// Unscope user if UnscopeOnDamaged is true
+	if( KFPawn_Monster(DamageCauser) != none && UnscopeOnDamaged )
+		SetIronSights(false);
+}
+
+simulated function ZoomIn(bool bAnimateTransition, float ZoomTimeToGo)
+{
+    super.ZoomIn(bAnimateTransition, ZoomTimeToGo);
+
+    if( IronsightZoomInSound != none && Instigator != none && Instigator.IsLocallyControlled() )
+		PlaySoundBase(IronsightZoomInSound, false);
+}
+
+simulated function ZoomOut( bool bAnimateTransition, float ZoomTimeToGo )
+{
+	super.ZoomOut( bAnimateTransition, ZoomTimeToGo );
+
+    if( IronsightZoomOutSound != none && Instigator != none && Instigator.IsLocallyControlled())
+		PlaySoundBase(IronsightZoomOutSound, false);
+}
+
+simulated state WeaponPuttingDown
+{
+    simulated function BeginState(name PreviousStateName)
+    {
+        Super.BeginState(PreviousStateName);
+        
+		if( bUsingSights )
+			SetIronSights(false);
+    }
+}
+
+exec function ZoomAmount(float ZoomAmount)
+{
+	PlayerIronSightFOV = ZoomAmount;
+
+	// Kick user out of iron sight if we changed zoom fov
+	if( bUsingSights )
+		SetIronSights(false);
+}
+
 // ****************************** HUD ******************************
 
 simulated event Tick( float DeltaTime )
@@ -332,21 +410,96 @@ simulated event Tick( float DeltaTime )
 	if( CurrentWeaponUpgradeIndex >= 1 )
 		DrawHudPassive1=true;
 	if( CurrentWeaponUpgradeIndex >= 2 )
-	{
 		DrawHudPassive2=true;
-        InstantHitDamageTypes[0] = UpgradedDamageType;
-	}
 }
 
 simulated function DrawHUD( HUD H, Canvas C )
 {
     local Texture2D AbilityIcon, AbilityDescriptionImage, Passive1Icon, Passive2Icon, Talent1Icon;
+    local Texture2D ScopeOverlay, ScopeOverlayRing, ScopeInnerRing, ScopeCrosshair, PerkCrosshair;
 	local KFPlayerController KFPC;
+	local float ResModifier;
+
+    // Trace
+    local vector TraceHitLocation, TraceHitNormal, TraceStart, TraceEnd;
+    local rotator TraceAimDir;
+    local float TraceDist;
+	local Actor	TraceHitActor;
+	// local TraceHitInfo HitInfo;
 
     // Don't draw canvas HUD in cinematic mode
 	KFPC = KFPlayerController(Instigator.Controller);
     if( KFPC != none && KFPC.bCinematicMode )
         return;
+
+	C.Font = FuroreFont;
+	ResModifier = WorldInfo.static.GetResolutionBasedHUDScale();
+
+    if( bUsingSights )
+    {
+    	// Weapon trace
+	   	TraceDist = 1500000;
+	    TraceStart = GetSafeStartTraceLocation();
+		TraceAimDir = GetAdjustedAim(TraceStart);
+	    TraceEnd = TraceStart + Vector(TraceAimDir) * TraceDist; // TraceAimDir
+	    TraceHitActor = Trace( TraceHitLocation, TraceHitNormal, TraceEnd, TraceStart, true, vect(0,0,0), /*HitInfo*/, 1 ); //TRACEFLAG_Bullet
+        
+        ScopeCrosshair = Texture2D'WEP_Aureolin_MAT.Aureolin_Parascope_Crosshair';
+		C.SetPos(C.SizeX * 0, C.SizeY * 0);
+		if( KFPawn_Monster(TraceHitActor) != none && KFPawn_Monster(TraceHitActor).IsAliveAndWell() )
+        	C.DrawColor = CrosshairColorTargetingZED;
+        else if( KFPawn_Human(TraceHitActor) != none && KFPawn_Human(TraceHitActor).IsAliveAndWell() )
+        	C.DrawColor = CrosshairColorTargetingFriendly;
+        else if( AmmoCount[0] == 0 )
+        	C.DrawColor = CrosshairColorEmpty;
+        else
+        	C.DrawColor = CrosshairColorNeutral;
+	    C.DrawTexture(ScopeCrosshair, C.ClipX/1920);
+
+		if( AmmoCount[0] == 1 )
+	    {
+	    	PerkCrosshair = Texture2D'WEP_Aureolin_MAT.Aureolin_Parascope_PerkCrosshair';
+			C.SetPos(C.SizeX * 0, C.SizeY * 0);
+			if( KFPawn_Monster(TraceHitActor) != none && KFPawn_Monster(TraceHitActor).IsAliveAndWell() )
+	        	C.DrawColor = PerkCrosshairColorTargetingZED;
+	        else if( KFPawn_Human(TraceHitActor) != none && KFPawn_Human(TraceHitActor).IsAliveAndWell() )
+	        	C.DrawColor = PerkCrosshairColorTargetingFriendly;
+	        else
+	        	C.DrawColor = PerkCrosshairColorNeutral;
+	    	C.DrawTexture(PerkCrosshair, C.ClipX/1920);
+	    }
+
+        ScopeInnerRing = Texture2D'WEP_Aureolin_MAT.Aureolin_Parascope_Inner_Ring';
+		C.SetPos(C.SizeX * 0, C.SizeY * 0);
+		if( KFPawn_Monster(TraceHitActor) != none && KFPawn_Monster(TraceHitActor).IsAliveAndWell() )
+        	C.DrawColor = ScopeRingInnerColorTargetingZED;
+        else if( KFPawn_Human(TraceHitActor) != none && KFPawn_Human(TraceHitActor).IsAliveAndWell() )
+        	C.DrawColor = ScopeRingInnerColorTargetingFriendly;
+        else if( AmmoCount[0] == 0 )
+        	C.DrawColor = ScopeRingInnerColorEmpty;
+        else
+        	C.DrawColor = ScopeRingInnerColorNeutral;
+	    C.DrawTexture(ScopeInnerRing, C.ClipX/1920);
+
+	    if( EnableZoomLevelDisplay )
+	    {
+		    // Zoom level display
+			C.SetPos(C.SizeX * 0.425 * ResModifier, C.SizeY * 0.57 * ResModifier);
+	   		C.DrawColor = ZoomLevelDisplayColor;
+		    C.DrawText(int(PlayerIronSightFOV)@"FOV",, C.ClipX/2000 * ResModifier, C.ClipX/2000 * ResModifier);
+		}
+
+	   	ScopeOverlay = Texture2D'WEP_Aureolin_MAT.Aureolin_Parascope';
+		C.SetPos(C.SizeX * 0, C.SizeY * 0);
+	   	C.SetDrawColor(255,255,255,SeeThroughFloat);
+		C.DrawTexture(ScopeOverlay, C.ClipX/1920);
+
+		// This takes priority
+        ScopeOverlayRing = Texture2D'WEP_Aureolin_MAT.Aureolin_Parascope_Ring';
+		C.SetPos(C.SizeX * 0, C.SizeY * 0);
+	   	C.SetDrawColor(255,255,255,SeeThroughRingFloat);
+	    C.DrawTexture(ScopeOverlayRing, C.ClipX/1920);
+    }
 
     // The Ability icon (Combustion Rounds)
 	AbilityIcon = Texture2D'Fass_MAT.Perk_Icons.Combustion_Rounds_Perk_Icon';
@@ -412,6 +565,149 @@ exec function TZS()
 
     DrawHudPassive1 = !DrawHudPassive1;
     DrawHudPassive2 = !DrawHudPassive2;
+}
+
+// ****************************** Colorization ******************************
+
+// **************** Crosshair ****************
+exec function ChangeCrosshairColorNeutral(float Red, float Green, float Blue)
+{
+	CrosshairColorNeutral.R = Red;
+	CrosshairColorNeutral.G = Green;
+	CrosshairColorNeutral.B = Blue;
+	SaveConfig();
+}
+exec function ChangeCrosshairColorEmpty(float Red, float Green, float Blue)
+{
+	CrosshairColorEmpty.R = Red;
+	CrosshairColorEmpty.G = Green;
+	CrosshairColorEmpty.B = Blue;
+	SaveConfig();
+}
+exec function ChangeTargetingZEDColor(float Red, float Green, float Blue)
+{
+	CrosshairColorTargetingZED.R = Red;
+	CrosshairColorTargetingZED.G = Green;
+	CrosshairColorTargetingZED.B = Blue;
+	SaveConfig();
+}
+exec function ChangeTargetingFriendlyColor(float Red, float Green, float Blue)
+{
+	CrosshairColorTargetingFriendly.R = Red;
+	CrosshairColorTargetingFriendly.G = Green;
+	CrosshairColorTargetingFriendly.B = Blue;
+	SaveConfig();
+}
+
+// **************** Perk crosshair ****************
+exec function ChangePerkCrosshairColor(float Red, float Green, float Blue)
+{
+	PerkCrosshairColorNeutral.R = Red;
+	PerkCrosshairColorNeutral.G = Green;
+	PerkCrosshairColorNeutral.B = Blue;
+	SaveConfig();
+}
+exec function ChangePerkCrosshairTargetingZEDColor(float Red, float Green, float Blue)
+{
+	PerkCrosshairColorTargetingZED.R = Red;
+	PerkCrosshairColorTargetingZED.G = Green;
+	PerkCrosshairColorTargetingZED.B = Blue;
+	SaveConfig();
+}
+exec function ChangePerkCrosshairTargetingFriendlyColor(float Red, float Green, float Blue)
+{
+	PerkCrosshairColorTargetingFriendly.R = Red;
+	PerkCrosshairColorTargetingFriendly.G = Green;
+	PerkCrosshairColorTargetingFriendly.B = Blue;
+	SaveConfig();
+}
+
+// **************** Inner ring ****************
+exec function ChangeScopeRingInnerColorNeutral(float Red, float Green, float Blue)
+{
+	ScopeRingInnerColorNeutral.R = Red;
+	ScopeRingInnerColorNeutral.G = Green;
+	ScopeRingInnerColorNeutral.B = Blue;
+	SaveConfig();
+}
+exec function ChangeScopeRingInnerColorEmpty(float Red, float Green, float Blue)
+{
+	ScopeRingInnerColorEmpty.R = Red;
+	ScopeRingInnerColorEmpty.G = Green;
+	ScopeRingInnerColorEmpty.B = Blue;
+	SaveConfig();
+}
+exec function ChangeScopeRingInnerColorTargetingZED(float Red, float Green, float Blue)
+{
+	ScopeRingInnerColorTargetingZED.R = Red;
+	ScopeRingInnerColorTargetingZED.G = Green;
+	ScopeRingInnerColorTargetingZED.B = Blue;
+	SaveConfig();
+}
+exec function ChangeScopeRingInnerColorTargetingFriendly(float Red, float Green, float Blue)
+{
+	ScopeRingInnerColorTargetingFriendly.R = Red;
+	ScopeRingInnerColorTargetingFriendly.G = Green;
+	ScopeRingInnerColorTargetingFriendly.B = Blue;
+	SaveConfig();
+}
+
+// ****************************** Executable commands ******************************
+
+// **************** Overlay ****************
+exec function SeeThroughOverlayAmount(float SeeThroughAmount)
+{
+	local KFPlayerController KFPC;
+
+	SeeThroughFloat = SeeThroughAmount;
+
+	KFPC = KFPlayerController(Instigator.Controller);
+	if( KFPC != none )
+    	KFPC.MyGFxHUD.HudChatBox.AddChatMessage("See through overlay amount is:"@int(SeeThroughFloat), "AAFF00");
+	SaveConfig();
+}
+
+// **************** Overlay ring ****************
+exec function SeeThroughOverlayRingAmount(float SeeThroughAmount)
+{
+	local KFPlayerController KFPC;
+
+	SeeThroughRingFloat = SeeThroughAmount;
+	
+	KFPC = KFPlayerController(Instigator.Controller);
+	if( KFPC != none )
+	    KFPC.MyGFxHUD.HudChatBox.AddChatMessage("See through ring overlay amount is:"@int(SeeThroughRingFloat), "AAFF00");
+	SaveConfig();
+}
+
+// **************** Zoom level ****************
+exec function ToggleZoomLevelDisplay()
+{
+	local KFPlayerController KFPC;
+
+	EnableZoomLevelDisplay = !EnableZoomLevelDisplay;
+
+	KFPC = KFPlayerController(Instigator.Controller);
+	if( EnableZoomLevelDisplay && KFPC != none )
+    	KFPC.MyGFxHUD.HudChatBox.AddChatMessage("Zoom level display is:"@EnableZoomLevelDisplay, "AAFF00");
+    else
+    	KFPC.MyGFxHUD.HudChatBox.AddChatMessage("Zoom level display is:"@EnableZoomLevelDisplay, "FF0000");
+	SaveConfig();
+}
+
+// **************** Scope ****************
+exec function ToggleUnscopeOnDamaged()
+{
+	local KFPlayerController KFPC;
+
+	UnscopeOnDamaged = !UnscopeOnDamaged;
+
+	KFPC = KFPlayerController(Instigator.Controller);
+	if( UnscopeOnDamaged && KFPC != none )
+    	KFPC.MyGFxHUD.HudChatBox.AddChatMessage("Unscope user on damaged:"@EnableZoomLevelDisplay, "AAFF00");
+    else
+    	KFPC.MyGFxHUD.HudChatBox.AddChatMessage("Unscope user on damaged:"@EnableZoomLevelDisplay, "FF0000");
+	SaveConfig();
 }
 
 // ************** Misc **************
@@ -535,11 +831,13 @@ defaultproperties
     // FOV
 	MeshFOV=86
 	MeshIronSightFOV=77
-    PlayerIronSightFOV=77
+    PlayerIronSightFOV=40
 
 	// Zooming/Position
 	PlayerViewOffset=(X=14.0,Y=10,Z=-4)
-	IronSightPosition=(X=11,Y=0,Z=0)
+	IronSightPosition=(X=0,Y=0,Z=-30)
+    IronsightZoomInSound=SoundCue'Fass_SND.Fass_zoomin_Cue'
+    IronsightZoomOutSound=SoundCue'Fass_SND.Fass_zoomout_Cue'
 
 	// Content
 	PackageKey="Aureolin"

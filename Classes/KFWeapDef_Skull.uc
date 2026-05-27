@@ -6,8 +6,8 @@ DefaultProperties
 	WeaponClassPath="Fass.KFWeap_Skull"
 	ImagePath="Fass_MAT.UI_WeaponSelect_Skull"
 
-	BuyPrice=550
-	AmmoPricePerMag=20
+	BuyPrice=1
+	AmmoPricePerMag=1
 
 	EffectiveRange=50
 }
